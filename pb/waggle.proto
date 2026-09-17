@@ -1,0 +1,13 @@
+syntax="proto3";
+
+option go_package="github.com/sukunrt/go-waggle/pb";
+
+message TopicSubscription {
+  optional bytes topicID = 1;
+}
+
+message ObjectPieces {
+  optional bytes objectID = 2;
+  optional bytes piecesMetadata = 3;
+  optional bytes pieces = 4;
+}
