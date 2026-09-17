@@ -16,6 +16,7 @@ const (
 type Conn interface {
 	NewStream() (Stream, error)
 	AcceptStream(ctx context.Context) (Stream, error)
+	CloseWithError(code uint64, description string) error
 }
 
 type Stream interface {

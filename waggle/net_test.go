@@ -79,6 +79,7 @@ func newTestNet(t *testing.T, numNodes int) *testNet {
 			Transport: qt,
 			TestNet:   tn,
 			Listener:  ql,
+			Waggle:    NewWaggle(),
 		}
 		tn.nodes[n.P] = n
 		tn.Nodes = append(tn.Nodes, n)
@@ -107,6 +108,7 @@ type node struct {
 	Transport *quic.Transport
 	TestNet   *testNet
 	Listener  *quic.Listener
+	Waggle    *Waggle
 }
 
 func (n *node) DialPeer(ctx context.Context, p conn.PeerID) (conn.Conn, error) {
