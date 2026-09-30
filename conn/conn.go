@@ -20,9 +20,12 @@ type Conn interface {
 }
 
 type Stream interface {
+	Conn() Conn
+
 	Read(p []byte) (int, error)
 	Write(p []byte) (int, error)
 	Close() error
+
 	ResetWithError(errorCode uint64)
 	SetReadDeadline(t time.Time) error
 	SetWriteDeadline(t time.Time) error

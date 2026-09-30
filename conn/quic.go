@@ -18,7 +18,7 @@ func (q QUICConn) AcceptStream(ctx context.Context) (Stream, error) {
 	if err != nil {
 		return nil, err
 	}
-	return quicStream{qstream: stream}, nil
+	return quicStream{qstream: stream, conn: q}, nil
 }
 
 func (q QUICConn) NewStream() (Stream, error) {
@@ -26,7 +26,7 @@ func (q QUICConn) NewStream() (Stream, error) {
 	if err != nil {
 		return nil, err
 	}
-	return quicStream{qstream: stream}, nil
+	return quicStream{qstream: stream, conn: q}, nil
 }
 
 // CloseWithError closes the connection
@@ -36,6 +36,11 @@ func (q QUICConn) CloseWithError(code uint64, description string) error {
 
 type quicStream struct {
 	qstream *quic.Stream
+	conn    QUICConn
+}
+
+func (q quicStream) Conn() Conn {
+	return q.conn
 }
 
 // Close implements [Stream].
@@ -74,4 +79,4 @@ func (q quicStream) Write(p []byte) (int, error) {
 	return q.qstream.Write(p)
 }
 
-var _ Stream = quicStream{nil}
+var _ Stream = quicStream{}
