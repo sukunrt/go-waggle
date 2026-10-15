@@ -96,7 +96,7 @@ func (w *Waggle) readTopicHeader(s conn.Stream) (*pb.TopicSubscription, error) {
 func (w *Waggle) HandleInboundStream(p conn.PeerID, s conn.Stream) (topicID string, _ error) {
 	topicSub, err := w.readTopicHeader(s)
 	if err != nil {
-		s.ResetWithError(42)
+		s.ResetWithError(conn.StreamErrorCodeUndecided)
 		return "", err
 	}
 
@@ -117,7 +117,7 @@ func (w *Waggle) HandleInboundStream(p conn.PeerID, s conn.Stream) (topicID stri
 			// multiple streams. reset the earlier stream
 			// note it's not necessary that this is the correct stream to reset
 			// streams may be delivered to us out of order.
-			ss.ResetWithError(42)
+			ss.ResetWithError(conn.StreamErrorCodeUndecided)
 		}
 		tm[p] = s
 	} else {
@@ -134,7 +134,7 @@ func (w *Waggle) openReceiveStream(c conn.Conn, topicID string) (_ conn.Stream, 
 	}
 	defer func() {
 		if errorVal != nil {
-			s.ResetWithError(42)
+			s.ResetWithError(conn.StreamErrorCodeUndecided)
 		}
 	}()
 
@@ -205,7 +205,7 @@ func (w *Waggle) DisconnectPeer(p conn.PeerID, c conn.Conn) {
 	for topicID, m := range w.pendingStreams {
 		s, ok := m[p]
 		if ok && s.Conn() == c {
-			s.ResetWithError(42)
+			s.ResetWithError(conn.StreamErrorCodeUndecided)
 			delete(m, p)
 		}
 		if len(m) == 0 {
@@ -410,7 +410,7 @@ const sendMessageBufferSize = 4
 
 func (t *Topic) handleSendStream(p conn.PeerID, s conn.Stream) {
 	if t.ctx.Err() != nil {
-		s.ResetWithError(42)
+		s.ResetWithError(conn.StreamErrorCodeUndecided)
 		return
 	}
 
@@ -423,13 +423,13 @@ func (t *Topic) handleSendStream(p conn.PeerID, s conn.Stream) {
 		msgs:          make(chan *pb.ObjectPieces, sendMessageBufferSize+4),
 	}:
 	case <-t.ctx.Done():
-		s.ResetWithError(42)
+		s.ResetWithError(conn.StreamErrorCodeUndecided)
 	}
 }
 
 func (t *Topic) handleReceiveStream(p conn.PeerID, s conn.Stream) {
 	if t.ctx.Err() != nil {
-		s.ResetWithError(42)
+		s.ResetWithError(conn.StreamErrorCodeUndecided)
 		return
 	}
 
@@ -439,7 +439,7 @@ func (t *Topic) handleReceiveStream(p conn.PeerID, s conn.Stream) {
 		Stream: s,
 	}:
 	case <-t.ctx.Done():
-		s.ResetWithError(42)
+		s.ResetWithError(conn.StreamErrorCodeUndecided)
 		return
 	}
 }
@@ -502,7 +502,7 @@ func (t *Topic) ReceiveMessage() (conn.PeerID, *pb.ObjectPieces) {
 }
 
 func (t *Topic) runReceiveStream(p conn.PeerID, s conn.Stream) {
-	defer s.ResetWithError(42)
+	defer s.ResetWithError(conn.StreamErrorCodeUndecided)
 
 	buf := make([]byte, maxMessageLength)
 	br := &byteReader{r: s}
@@ -536,7 +536,7 @@ func (t *Topic) runReceiveStream(p conn.PeerID, s conn.Stream) {
 
 func (t *Topic) cancelReceiveStreams() {
 	for _, s := range t.receiveStreams {
-		s.ResetWithError(42)
+		s.ResetWithError(conn.StreamErrorCodeUndecided)
 	}
 	clear(t.receiveStreams)
 }
@@ -544,7 +544,7 @@ func (t *Topic) cancelReceiveStreams() {
 func (t *Topic) cancelSendStreams() {
 	for _, s := range t.streamSenders {
 		s.Cancel()
-		s.Stream.ResetWithError(42)
+		s.Stream.ResetWithError(conn.StreamErrorCodeUndecided)
 	}
 	clear(t.streamSenders)
 }
@@ -602,13 +602,13 @@ func (t *Topic) disconnectPeer(p conn.PeerID, c conn.Conn) {
 	if ok {
 		if ss.Stream.Conn() == c {
 			ss.Cancel()
-			ss.Stream.ResetWithError(42)
+			ss.Stream.ResetWithError(conn.StreamErrorCodeUndecided)
 		}
 	}
 	rs, ok := t.receiveStreams[p]
 	if ok {
 		if rs.Conn() == c {
-			rs.ResetWithError(42)
+			rs.ResetWithError(conn.StreamErrorCodeUndecided)
 		}
 	}
 }
@@ -636,7 +636,7 @@ func (t *Topic) handleStreamSender(ss streamSender, wg *sync.WaitGroup) {
 	ssold, ok := t.streamSenders[ss.P]
 	if ok {
 		ssold.Cancel()
-		ssold.Stream.ResetWithError(42)
+		ssold.Stream.ResetWithError(conn.StreamErrorCodeUndecided)
 	}
 	ss.Ctx, ss.Cancel = context.WithCancel(t.ctx)
 	t.streamSenders[ss.P] = &ss
@@ -646,11 +646,11 @@ func (t *Topic) handleStreamSender(ss streamSender, wg *sync.WaitGroup) {
 
 func (t *Topic) handleReceiveStreamLoop(rs receiveStream, wg *sync.WaitGroup) {
 	if !t.subscribed.Load() {
-		rs.Stream.ResetWithError(42)
+		rs.Stream.ResetWithError(conn.StreamErrorCodeUndecided)
 	} else {
 		ss, ok := t.receiveStreams[rs.P]
 		if ok {
-			ss.ResetWithError(42)
+			ss.ResetWithError(conn.StreamErrorCodeUndecided)
 		}
 		t.receiveStreams[rs.P] = rs.Stream
 		wg.Go(func() { t.runReceiveStream(rs.P, rs.Stream) })
@@ -661,9 +661,9 @@ func (t *Topic) drainTillComplete(done chan struct{}) {
 	for {
 		select {
 		case rs := <-t.receiveStreamsCh:
-			rs.Stream.ResetWithError(42)
+			rs.Stream.ResetWithError(conn.StreamErrorCodeUndecided)
 		case ss := <-t.streamSenderCh:
-			ss.Stream.ResetWithError(42)
+			ss.Stream.ResetWithError(conn.StreamErrorCodeUndecided)
 		case <-t.peerDisconnectCh:
 		case <-t.senderComplete:
 		case <-t.sendMessageReq:
@@ -672,9 +672,9 @@ func (t *Topic) drainTillComplete(done chan struct{}) {
 			for {
 				select {
 				case rs := <-t.receiveStreamsCh:
-					rs.Stream.ResetWithError(42)
+					rs.Stream.ResetWithError(conn.StreamErrorCodeUndecided)
 				case ss := <-t.streamSenderCh:
-					ss.Stream.ResetWithError(42)
+					ss.Stream.ResetWithError(conn.StreamErrorCodeUndecided)
 				case <-t.peerDisconnectCh:
 				case <-t.senderComplete:
 				case <-t.sendMessageReq:
@@ -725,7 +725,7 @@ func (s *streamSender) loop() {
 	defer func() {
 		s.CompleteCh <- s
 	}()
-	defer s.Stream.ResetWithError(42)
+	defer s.Stream.ResetWithError(conn.StreamErrorCodeUndecided)
 	for {
 		var msg *pb.ObjectPieces
 		select {

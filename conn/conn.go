@@ -10,7 +10,9 @@ import (
 type PeerID = peer.ID
 
 const (
-	WaggleProtocolID = "/wag-1"
+	WaggleProtocolID = "/waggle/1.0"
+
+	StreamErrorCodeUndecided = 42
 )
 
 type Conn interface {
