@@ -24,6 +24,7 @@ type topicState struct {
 	Wg    sync.WaitGroup
 }
 
+// Waggle is the object to handle waggle streams and create topics, initiate topic streams.
 type Waggle struct {
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -36,6 +37,7 @@ type Waggle struct {
 	peers            map[conn.PeerID]conn.Conn
 }
 
+// NewWaggle returns the waggle object
 func NewWaggle() *Waggle {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Waggle{
@@ -86,10 +88,11 @@ func (w *Waggle) readTopicHeader(s conn.Stream) (*pb.TopicSubscription, error) {
 	return topicSub, nil
 }
 
-// HandleInboundStream handles an inbound stream from the peer
-//
+// HandleInboundStream handles an inbound waggle stream from the peer.
 // If a topic exists, it hands the stream to the topic, otherwise it parks the stream
 // in case we interact with the peer on that topic.
+//
+// If using with go-libp2p push the stream to the handler after multistream select.
 func (w *Waggle) HandleInboundStream(p conn.PeerID, s conn.Stream) (topicID string, _ error) {
 	topicSub, err := w.readTopicHeader(s)
 	if err != nil {
@@ -161,6 +164,8 @@ func (w *Waggle) openReceiveStream(c conn.Conn, topicID string) (_ conn.Stream, 
 	return s, nil
 }
 
+// AddPeer adds a peer to our waggle peer set. It opens receive streams
+// for all subscribed topics in the waggle peer set.
 func (w *Waggle) AddPeer(p conn.PeerID, c conn.Conn) {
 	// TODO: bound these goroutines
 	w.mx.Lock()
@@ -186,6 +191,8 @@ func (w *Waggle) AddPeer(p conn.PeerID, c conn.Conn) {
 	return
 }
 
+// DisconnectPeer removes a peer from our waggle peer set and closes all
+// receive and send streams.
 func (w *Waggle) DisconnectPeer(p conn.PeerID, c conn.Conn) {
 	w.mx.Lock()
 	defer w.mx.Unlock()
@@ -211,6 +218,7 @@ func (w *Waggle) DisconnectPeer(p conn.PeerID, c conn.Conn) {
 	}
 }
 
+// NewTopic creates a waggle topic
 func (w *Waggle) NewTopic(topicID string) (*Topic, error) {
 	if len(topicID) >= 1024 {
 		return nil, errors.New("topic id too long")
@@ -301,6 +309,10 @@ type peerDisconnected struct {
 	Conn conn.Conn
 }
 
+// Topic is a waggle topic to exchange objects of a specific type. For ethereum,
+// this can be used for Attestations, Blocks, etc. The semantics of the objects are
+// left to the application. A waggle topic allows exchanging arbitrary objects and
+// their metadata.
 type Topic struct {
 	TopicID string
 
@@ -363,6 +375,7 @@ func (t *Topic) Close() {
 	t.wg.Wait()
 }
 
+// Subscribe subscribes to receiving messages from peers.
 func (t *Topic) Subscribe() {
 	if t.subscribed.Load() {
 		return
@@ -431,6 +444,7 @@ func (t *Topic) handleReceiveStream(p conn.PeerID, s conn.Stream) {
 	}
 }
 
+// DisconnectPeer disconnects a peer.
 func (t *Topic) DisconnectPeer(p conn.PeerID, c conn.Conn) {
 	if t.ctx.Err() != nil {
 		return
@@ -446,7 +460,9 @@ func (t *Topic) DisconnectPeer(p conn.PeerID, c conn.Conn) {
 	}
 }
 
-func (t *Topic) Peers() []conn.PeerID {
+// PeersWithCapacity returns all free peers to send a message to.
+// It must not be used concurrently with `SendMessage`
+func (t *Topic) PeersWithCapacity() []conn.PeerID {
 	ch := make(chan []conn.PeerID, 1)
 	select {
 	case t.peersWithCapacityCh <- ch:
@@ -461,6 +477,7 @@ func (t *Topic) Peers() []conn.PeerID {
 	}
 }
 
+// SendMessage sends the msg to peer p
 func (t *Topic) SendMessage(p conn.PeerID, msg *pb.ObjectPieces) {
 	if t.ctx.Err() != nil {
 		return
@@ -474,6 +491,7 @@ func (t *Topic) SendMessage(p conn.PeerID, msg *pb.ObjectPieces) {
 	}
 }
 
+// ReceiveMessage receives the next message from the incoming message queue. 
 func (t *Topic) ReceiveMessage() (conn.PeerID, *pb.ObjectPieces) {
 	select {
 	case msg := <-t.incomingMessages:

@@ -42,7 +42,7 @@ func TestWaggleMessageSending(t *testing.T) {
 
 		synctest.Wait()
 
-		peers := tp2.Peers()
+		peers := tp2.PeersWithCapacity()
 		require.Contains(t, peers, n1.P)
 
 		tp2.SendMessage(n1.P, &pb.ObjectPieces{
@@ -101,7 +101,7 @@ func TestWaggleMessageSendingMultiple(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, topic, topicID)
 
-			peers := tp.Peers()
+			peers := tp.PeersWithCapacity()
 			require.ElementsMatch(t, expectedPeers, peers)
 			for _, p := range peers {
 				tp.SendMessage(p, &pb.ObjectPieces{

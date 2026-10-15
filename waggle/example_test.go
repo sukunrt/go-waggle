@@ -261,7 +261,7 @@ func (b *broadcaster) handleMessage(in incomingMessage) {
 }
 
 func (b *broadcaster) sendPending() {
-	for _, p := range b.Topic.Peers() {
+	for _, p := range b.Topic.PeersWithCapacity() {
 		for objectID := range b.Messages {
 			b.peerObject(p, objectID)
 		}
@@ -347,7 +347,7 @@ func TestBroadcasterPieces(t *testing.T) {
 		require.Empty(t, advertisement.Pieces)
 
 		synctest.Wait()
-		require.Contains(t, receiver.Topic.Peers(), sender.Node.P)
+		require.Contains(t, receiver.Topic.PeersWithCapacity(), sender.Node.P)
 		request, err := json.Marshal(metadata{Request: ids})
 		require.NoError(t, err)
 		receiver.Topic.SendMessage(sender.Node.P, &pb.ObjectPieces{
