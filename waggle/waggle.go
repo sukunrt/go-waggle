@@ -460,6 +460,7 @@ func (t *Topic) DisconnectPeer(p conn.PeerID, c conn.Conn) {
 	}
 }
 
+
 // PeersWithCapacity returns all free peers to send a message to.
 // It must not be used concurrently with `SendMessage`
 func (t *Topic) PeersWithCapacity() []conn.PeerID {
@@ -491,46 +492,13 @@ func (t *Topic) SendMessage(p conn.PeerID, msg *pb.ObjectPieces) {
 	}
 }
 
-// ReceiveMessage receives the next message from the incoming message queue. 
+// ReceiveMessage receives the next message from the incoming message queue.
 func (t *Topic) ReceiveMessage() (conn.PeerID, *pb.ObjectPieces) {
 	select {
 	case msg := <-t.incomingMessages:
 		return msg.P, msg.Message
 	case <-t.ctx.Done():
 		return "", nil
-	}
-}
-
-func (t *Topic) runReceiveStream(p conn.PeerID, s conn.Stream) {
-	defer s.ResetWithError(conn.StreamErrorCodeUndecided)
-
-	buf := make([]byte, maxMessageLength)
-	br := &byteReader{r: s}
-	for {
-		length, err := binary.ReadUvarint(br)
-		if err != nil {
-			return
-		}
-		if length > maxMessageLength {
-			return // maybe just drop the message?
-		}
-		buf = buf[:length]
-		if _, err := io.ReadFull(s, buf); err != nil {
-			return
-		}
-		msg := &pb.ObjectPieces{}
-
-		if err := proto.Unmarshal(buf, msg); err != nil {
-			return
-		}
-		select {
-		case t.incomingMessages <- incomingMessage{
-			P:       p,
-			Message: msg,
-		}:
-		case <-t.ctx.Done():
-			return
-		}
 	}
 }
 
@@ -641,7 +609,7 @@ func (t *Topic) handleStreamSender(ss streamSender, wg *sync.WaitGroup) {
 	ss.Ctx, ss.Cancel = context.WithCancel(t.ctx)
 	t.streamSenders[ss.P] = &ss
 	t.sendBufFree[ss.P] = sendMessageBufferSize
-	wg.Go(ss.loop)
+	wg.Go(ss.sendLoop)
 }
 
 func (t *Topic) handleReceiveStreamLoop(rs receiveStream, wg *sync.WaitGroup) {
@@ -653,7 +621,7 @@ func (t *Topic) handleReceiveStreamLoop(rs receiveStream, wg *sync.WaitGroup) {
 			ss.ResetWithError(conn.StreamErrorCodeUndecided)
 		}
 		t.receiveStreams[rs.P] = rs.Stream
-		wg.Go(func() { t.runReceiveStream(rs.P, rs.Stream) })
+		wg.Go(func() { t.recvLoop(rs.P, rs.Stream) })
 	}
 }
 
@@ -720,7 +688,7 @@ func (s *streamSender) sendMessage(m *pb.ObjectPieces) {
 	}
 }
 
-func (s *streamSender) loop() {
+func (s *streamSender) sendLoop() {
 	defer s.Cancel()
 	defer func() {
 		s.CompleteCh <- s
@@ -751,5 +719,38 @@ func (s *streamSender) loop() {
 		}
 
 		s.SentMessageCh <- s
+	}
+}
+
+func (t *Topic) recvLoop(p conn.PeerID, s conn.Stream) {
+	defer s.ResetWithError(conn.StreamErrorCodeUndecided)
+
+	buf := make([]byte, maxMessageLength)
+	br := &byteReader{r: s}
+	for {
+		length, err := binary.ReadUvarint(br)
+		if err != nil {
+			return
+		}
+		if length > maxMessageLength {
+			return // maybe just drop the message?
+		}
+		buf = buf[:length]
+		if _, err := io.ReadFull(s, buf); err != nil {
+			return
+		}
+		msg := &pb.ObjectPieces{}
+
+		if err := proto.Unmarshal(buf, msg); err != nil {
+			return
+		}
+		select {
+		case t.incomingMessages <- incomingMessage{
+			P:       p,
+			Message: msg,
+		}:
+		case <-t.ctx.Done():
+			return
+		}
 	}
 }

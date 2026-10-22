@@ -1,0 +1,67 @@
+{
+  "script": [
+    {
+      "type": "ifNodeIDEquals",
+      "nodeID": 0,
+      "instruction": {
+        "type": "initWaggle",
+        "waggleParams": {}
+      }
+    },
+    {
+      "type": "ifNodeIDEquals",
+      "nodeID": 1,
+      "instruction": {
+        "type": "initWaggle",
+        "waggleParams": {}
+      }
+    },
+    {
+      "type": "ifNodeIDEquals",
+      "nodeID": 0,
+      "instruction": {
+        "type": "connect",
+        "connectTo": [
+          1
+        ]
+      }
+    },
+    {
+      "type": "subscribeToTopic",
+      "topicID": "waggle-topic"
+    },
+    {
+      "type": "waitUntil",
+      "elapsedSeconds": 30
+    },
+    {
+      "type": "ifNodeIDEquals",
+      "nodeID": 0,
+      "instruction": {
+        "type": "addPiece",
+        "parts": 48,
+        "topicID": "waggle-topic",
+        "objectID": 14549377870619113110
+      }
+    },
+    {
+      "type": "ifNodeIDEquals",
+      "nodeID": 1,
+      "instruction": {
+        "type": "addPiece",
+        "parts": 207,
+        "topicID": "waggle-topic",
+        "objectID": 14549377870619113110
+      }
+    },
+    {
+      "type": "publish",
+      "topicID": "waggle-topic",
+      "objectID": 14549377870619113110
+    },
+    {
+      "type": "waitUntil",
+      "elapsedSeconds": 40
+    }
+  ]
+}

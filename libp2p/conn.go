@@ -3,8 +3,6 @@ package libp2p
 import (
 	"context"
 	"errors"
-	"io"
-	"slices"
 	"sync"
 	"time"
 
@@ -13,7 +11,6 @@ import (
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/protocol"
-	msmux "github.com/multiformats/go-multistream"
 
 	"github.com/sukunrt/go-waggle/conn"
 	"github.com/sukunrt/go-waggle/waggle"
@@ -25,9 +22,9 @@ const (
 	maxWorkers       = 50
 )
 
-// ConfigureHost configures the host to plug in its waggle peers to w. When the conn that
-// w uses closes, w uses a different open conn. When no conn is open, it
-// removes the peer. It also sends inbound waggle streams to w.
+// ConfigureHost configures the host to plug in its waggle peers to w. It adds a
+// peer when identify shows waggle support and removes the peer when it is no
+// longer connected. It also sends inbound waggle streams to w.
 //
 // stop removes link and newly connected peers are not added to w.
 func ConfigureHost(w *waggle.Waggle, h host.Host) (stop func(), err error) {
@@ -36,26 +33,24 @@ func ConfigureHost(w *waggle.Waggle, h host.Host) (stop func(), err error) {
 		return nil, err
 	}
 
-	closed := make(chan network.Conn, 64)
+	m := &peerManager{
+		waggle:    w,
+		host:      h,
+		semaphore: make(chan struct{}, maxWorkers),
+		signal:    make(chan struct{}, 1),
+		added:     make(map[peer.ID]bool),
+		busy:      make(map[peer.ID]bool),
+	}
 	notifiee := &network.NotifyBundle{
-		DisconnectedF: func(_ network.Network, c network.Conn) { closed <- c },
+		DisconnectedF: func(_ network.Network, c network.Conn) { m.markClosed(c.RemotePeer()) },
 	}
 	h.Network().Notify(notifiee)
 
 	h.SetStreamHandler(protocolID, func(s network.Stream) {
-		w.HandleInboundStream(s.Conn().RemotePeer(), stream{s: s, rw: s})
+		w.HandleInboundStream(s.Conn().RemotePeer(), stream{Stream: s, h: h})
 	})
 
-	m := &peerManager{
-		waggle:     w,
-		host:       h,
-		semaphore:  make(chan struct{}, maxWorkers),
-		doneSignal: make(chan struct{}, 1),
-		conns:      make(map[peer.ID][]network.Conn),
-		active:     make(map[peer.ID]network.Conn),
-		busy:       make(map[peer.ID]bool),
-	}
-	m.wg.Go(func() { m.loop(sub, closed) })
+	m.wg.Go(func() { m.loop(sub) })
 
 	return sync.OnceFunc(func() {
 		h.RemoveStreamHandler(protocolID)
@@ -71,121 +66,110 @@ type peerManager struct {
 	wg        sync.WaitGroup
 	semaphore chan struct{}
 
-	doneMx     sync.Mutex
-	done       []peer.ID
-	doneSignal chan struct{}
+	queueMx sync.Mutex
+	closed  []peer.ID
+	done    []peer.ID
+	signal  chan struct{}
 
-	conns  map[peer.ID][]network.Conn
-	active map[peer.ID]network.Conn
-	busy   map[peer.ID]bool
+	added map[peer.ID]bool
+	busy  map[peer.ID]bool
 }
 
-func (m *peerManager) loop(sub event.Subscription, closed <-chan network.Conn) {
-	for _, c := range m.host.Network().Conns() {
-		protos, err := m.host.Peerstore().SupportsProtocols(c.RemotePeer(), protocolID)
-		if err == nil && len(protos) > 0 {
-			m.addConn(c)
-		}
+func (m *peerManager) loop(sub event.Subscription) {
+	for _, p := range m.host.Network().Peers() {
+		m.sync(p)
 	}
 	for {
-		m.clearDone()
+		m.processQueues()
 		select {
 		case e, ok := <-sub.Out():
 			if !ok {
 				return
 			}
-			evt := e.(event.EvtPeerIdentificationCompleted)
-			if slices.Contains(evt.Protocols, protocolID) {
-				m.addConn(evt.Conn)
-			} else {
-				delete(m.conns, evt.Peer)
-				m.sync(evt.Peer)
-			}
-		case c := <-closed:
-			m.removeConn(c)
-		case <-m.doneSignal:
+			m.sync(e.(event.EvtPeerIdentificationCompleted).Peer)
+		case <-m.signal:
 		}
 	}
 }
 
+func (m *peerManager) markClosed(p peer.ID) {
+	m.queueMx.Lock()
+	m.closed = append(m.closed, p)
+	m.queueMx.Unlock()
+	m.notify()
+}
+
 func (m *peerManager) markDone(p peer.ID) {
-	m.doneMx.Lock()
+	m.queueMx.Lock()
 	m.done = append(m.done, p)
-	m.doneMx.Unlock()
+	m.queueMx.Unlock()
+	m.notify()
+}
+
+func (m *peerManager) notify() {
 	select {
-	case m.doneSignal <- struct{}{}:
+	case m.signal <- struct{}{}:
 	default:
 	}
 }
 
-func (m *peerManager) clearDone() {
-	m.doneMx.Lock()
-	done := m.done
-	m.done = nil
-	m.doneMx.Unlock()
+func (m *peerManager) processQueues() {
+	m.queueMx.Lock()
+	closed, done := m.closed, m.done
+	m.closed, m.done = nil, nil
+	m.queueMx.Unlock()
+	for _, p := range closed {
+		m.sync(p)
+	}
 	for _, p := range done {
 		delete(m.busy, p)
 		m.sync(p)
 	}
 }
 
-func (m *peerManager) addConn(c network.Conn) {
-	// Disconnected for c can come before this call.
-	if c.IsClosed() || c.Stat().Limited {
-		return
-	}
-	p := c.RemotePeer()
-	if !slices.Contains(m.conns[p], c) {
-		m.conns[p] = append(m.conns[p], c)
-	}
-	m.sync(p)
-}
-
-func (m *peerManager) removeConn(c network.Conn) {
-	p := c.RemotePeer()
-	m.conns[p] = slices.DeleteFunc(m.conns[p], func(cc network.Conn) bool { return cc == c })
-	if len(m.conns[p]) == 0 {
-		delete(m.conns, p)
-	}
-	m.sync(p)
-}
-
 func (m *peerManager) sync(p peer.ID) {
 	if m.busy[p] {
 		return
 	}
-	cur, conns := m.active[p], m.conns[p]
-	if cur == nil && len(conns) == 0 {
-		// nothing to do
-		return
-	}
-	if slices.Contains(conns, cur) {
-		return
-	}
-	var next network.Conn
-	if len(conns) == 0 {
-		delete(m.active, p)
+	c := libp2pConn{h: m.host, p: p}
+	isConnected := m.host.Network().Connectedness(p) == network.Connected && m.supports(p)
+	if isConnected {
+		if m.added[p] {
+			return
+		}
+		m.added[p] = true
+		m.run(p, func() { m.waggle.AddPeer(p, c) })
 	} else {
-		next = conns[0]
-		m.active[p] = next
+		if !m.added[p] {
+			return
+		}
+		delete(m.added, p)
+		m.run(p, func() { m.waggle.DisconnectPeer(p, c) })
 	}
-	m.busy[p] = true
+}
 
+func (m *peerManager) run(p peer.ID, f func()) {
+	m.busy[p] = true
 	m.semaphore <- struct{}{}
 	m.wg.Go(func() {
 		defer func() { <-m.semaphore }()
-		if cur != nil {
-			m.waggle.DisconnectPeer(p, libp2pConn{cur})
-		}
-		if next != nil {
-			m.waggle.AddPeer(p, libp2pConn{next})
-		}
+		f()
 		m.markDone(p)
 	})
 }
 
+func (m *peerManager) supports(p peer.ID) bool {
+	protos, err := m.host.Peerstore().SupportsProtocols(p, protocolID)
+	return err == nil && len(protos) > 0
+}
+
+// libp2pConn refers to all conns to a peer. The host selects the conn for each stream.
+//
+// When a conn closes and the peer stays connected, the streams on that conn are not reopened.
+// TODO: Fix this ^
 type libp2pConn struct {
-	c network.Conn
+	h host.Host
+	p peer.ID
 }
 
 var _ conn.Conn = libp2pConn{}
@@ -193,16 +177,11 @@ var _ conn.Conn = libp2pConn{}
 func (c libp2pConn) NewStream() (conn.Stream, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), newStreamTimeout)
 	defer cancel()
-	s, err := c.c.NewStream(ctx)
+	s, err := c.h.NewStream(network.WithNoDial(ctx, "waggle"), c.p, protocolID)
 	if err != nil {
 		return nil, err
 	}
-	if err := s.SetProtocol(protocolID); err != nil {
-		s.ResetWithError(conn.StreamErrorCodeUndecided)
-		return nil, err
-	}
-	// Identify showed waggle support. Lazy negotiation saves a round trip.
-	return stream{s: s, rw: msmux.NewMSSelect(s, protocolID)}, nil
+	return stream{Stream: s, h: c.h}, nil
 }
 
 func (c libp2pConn) AcceptStream(context.Context) (conn.Stream, error) {
@@ -210,21 +189,19 @@ func (c libp2pConn) AcceptStream(context.Context) (conn.Stream, error) {
 }
 
 func (c libp2pConn) CloseWithError(code uint64, _ string) error {
-	return c.c.CloseWithError(network.ConnErrorCode(code))
+	var errs []error
+	for _, cc := range c.h.Network().ConnsToPeer(c.p) {
+		errs = append(errs, cc.CloseWithError(network.ConnErrorCode(code)))
+	}
+	return errors.Join(errs...)
 }
 
 type stream struct {
-	s  network.Stream
-	rw io.ReadWriteCloser
+	network.Stream
+	h host.Host
 }
 
 var _ conn.Stream = stream{}
 
-func (s stream) Conn() conn.Conn                    { return libp2pConn{s.s.Conn()} }
-func (s stream) Read(p []byte) (int, error)         { return s.rw.Read(p) }
-func (s stream) Write(p []byte) (int, error)        { return s.rw.Write(p) }
-func (s stream) Close() error                       { return s.rw.Close() }
-func (s stream) ResetWithError(code uint64)         { s.s.ResetWithError(network.StreamErrorCode(code)) }
-func (s stream) SetReadDeadline(t time.Time) error  { return s.s.SetReadDeadline(t) }
-func (s stream) SetWriteDeadline(t time.Time) error { return s.s.SetWriteDeadline(t) }
-func (s stream) SetDeadline(t time.Time) error      { return s.s.SetDeadline(t) }
+func (s stream) Conn() conn.Conn            { return libp2pConn{h: s.h, p: s.Stream.Conn().RemotePeer()} }
+func (s stream) ResetWithError(code uint64) { s.Stream.ResetWithError(network.StreamErrorCode(code)) }
