@@ -103,3 +103,14 @@ message ObjectPieces {
   optional bytes pieces = 4;
 }
 ```
+
+
+### Peer Scoring
+
+Thinking of cross topic scores, that are global to the peers. 
+
+Add an error code for resetting this stream for the topic name. 
+
+## How can we restart streams? ?
+
+

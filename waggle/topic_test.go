@@ -17,7 +17,7 @@ func TestTopicStreams(t *testing.T) {
 		tn := newTestNet(t, 2)
 
 		n1, n2 := tn.Nodes[0], tn.Nodes[1]
-		tp, err := n1.Waggle.NewTopic("topic1")
+		tp, err := n1.Waggle.NewTopic("topic1", 0, nil)
 		require.NoError(t, err)
 		tp.Subscribe()
 		defer tp.Close()

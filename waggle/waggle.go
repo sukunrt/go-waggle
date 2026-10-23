@@ -218,10 +218,17 @@ func (w *Waggle) DisconnectPeer(p conn.PeerID, c conn.Conn) {
 	}
 }
 
-// NewTopic creates a waggle topic
-func (w *Waggle) NewTopic(topicID string) (*Topic, error) {
+// NewTopic creates a waggle topic. sendQueueSize is the free send slots per peer, 0 sets the default.
+// onSendComplete is called on the peer's sender goroutine after each sent message. It can be nil.
+func (w *Waggle) NewTopic(topicID string, sendQueueSize int, onSendComplete func(ctx context.Context, p conn.PeerID)) (*Topic, error) {
 	if len(topicID) >= 1024 {
 		return nil, errors.New("topic id too long")
+	}
+	if sendQueueSize < 0 {
+		return nil, errors.New("send queue size is negative")
+	}
+	if sendQueueSize == 0 {
+		sendQueueSize = defaultSendQueueSize
 	}
 
 	w.mx.Lock()
@@ -229,7 +236,7 @@ func (w *Waggle) NewTopic(topicID string) (*Topic, error) {
 	if _, ok := w.topics[topicID]; ok {
 		return nil, errors.New("topic already exists")
 	}
-	t := newTopic(w.ctx, w, topicID)
+	t := newTopic(w.ctx, w, topicID, sendQueueSize, onSendComplete)
 	w.topics[topicID] = &topicState{Topic: t}
 	t.Start()
 
@@ -309,6 +316,21 @@ type peerDisconnected struct {
 	Conn conn.Conn
 }
 
+type peerCapacityRequest struct {
+	P    conn.PeerID
+	Resp chan peerCapacityResponse
+}
+
+type peerCapacityResponse struct {
+	Capacity int
+	Found    bool
+}
+
+var (
+	ErrTopicClosed  = errors.New("topic closed")
+	ErrPeerNotFound = errors.New("peer not found")
+)
+
 // Topic is a waggle topic to exchange objects of a specific type. For ethereum,
 // this can be used for Attestations, Blocks, etc. The semantics of the objects are
 // left to the application. A waggle topic allows exchanging arbitrary objects and
@@ -330,18 +352,19 @@ type Topic struct {
 	incomingMessages chan incomingMessage
 	receiveStreamsCh chan receiveStream
 	receiveStreams   map[conn.PeerID]conn.Stream
-	sentMessage      chan *streamSender
 	senderComplete   chan *streamSender
-	sendBufFree      map[conn.PeerID]int
+	onSendComplete   func(ctx context.Context, p conn.PeerID)
+	sendQueueSize    int
 
 	peersWithCapacityCh chan chan []conn.PeerID
+	peerCapacityCh      chan peerCapacityRequest
 	sendMessageReq      chan sendMessageRequest
 
-	streamSenderCh chan streamSender
+	streamSenderCh chan *streamSender
 	streamSenders  map[conn.PeerID]*streamSender
 }
 
-func newTopic(ctx context.Context, w *Waggle, topicID string) *Topic {
+func newTopic(ctx context.Context, w *Waggle, topicID string, sendQueueSize int, onSendComplete func(ctx context.Context, p conn.PeerID)) *Topic {
 	cctx, cancel := context.WithCancel(ctx)
 	return &Topic{
 		TopicID:             topicID,
@@ -354,12 +377,13 @@ func newTopic(ctx context.Context, w *Waggle, topicID string) *Topic {
 		incomingMessages:    make(chan incomingMessage, 32),
 		receiveStreamsCh:    make(chan receiveStream, 16),
 		receiveStreams:      map[conn.PeerID]conn.Stream{},
-		sentMessage:         make(chan *streamSender, 8),
 		senderComplete:      make(chan *streamSender, 8),
-		sendBufFree:         map[conn.PeerID]int{},
+		onSendComplete:      onSendComplete,
+		sendQueueSize:       sendQueueSize,
 		peersWithCapacityCh: make(chan chan []conn.PeerID, 4),
+		peerCapacityCh:      make(chan peerCapacityRequest, 4),
 		sendMessageReq:      make(chan sendMessageRequest, 4),
-		streamSenderCh:      make(chan streamSender, 8),
+		streamSenderCh:      make(chan *streamSender, 8),
 		streamSenders:       map[conn.PeerID]*streamSender{},
 	}
 
@@ -406,7 +430,7 @@ func (t *Topic) Unsubscribe() {
 	return
 }
 
-const sendMessageBufferSize = 4
+const defaultSendQueueSize = 4
 
 func (t *Topic) handleSendStream(p conn.PeerID, s conn.Stream) {
 	if t.ctx.Err() != nil {
@@ -415,12 +439,12 @@ func (t *Topic) handleSendStream(p conn.PeerID, s conn.Stream) {
 	}
 
 	select {
-	case t.streamSenderCh <- streamSender{
-		P:             p,
-		Stream:        s,
-		SentMessageCh: t.sentMessage,
-		CompleteCh:    t.senderComplete,
-		msgs:          make(chan *pb.ObjectPieces, sendMessageBufferSize+4),
+	case t.streamSenderCh <- &streamSender{
+		P:              p,
+		Stream:         s,
+		CompleteCh:     t.senderComplete,
+		OnSendComplete: t.onSendComplete,
+		msgs:           make(chan *pb.ObjectPieces, t.sendQueueSize+4),
 	}:
 	case <-t.ctx.Done():
 		s.ResetWithError(conn.StreamErrorCodeUndecided)
@@ -460,7 +484,6 @@ func (t *Topic) DisconnectPeer(p conn.PeerID, c conn.Conn) {
 	}
 }
 
-
 // PeersWithCapacity returns all free peers to send a message to.
 // It must not be used concurrently with `SendMessage`
 func (t *Topic) PeersWithCapacity() []conn.PeerID {
@@ -475,6 +498,25 @@ func (t *Topic) PeersWithCapacity() []conn.PeerID {
 		return peers
 	case <-t.ctx.Done():
 		return nil
+	}
+}
+
+// GetPeerCapacity returns the number of free send slots for peer p.
+func (t *Topic) GetPeerCapacity(p conn.PeerID) (int, error) {
+	req := peerCapacityRequest{P: p, Resp: make(chan peerCapacityResponse, 1)}
+	select {
+	case t.peerCapacityCh <- req:
+	case <-t.ctx.Done():
+		return 0, ErrTopicClosed
+	}
+	select {
+	case resp := <-req.Resp:
+		if !resp.Found {
+			return 0, ErrPeerNotFound
+		}
+		return max(resp.Capacity, 0), nil
+	case <-t.ctx.Done():
+		return 0, ErrTopicClosed
 	}
 }
 
@@ -541,10 +583,6 @@ func (t *Topic) loop() {
 
 		case ss := <-t.streamSenderCh:
 			t.handleStreamSender(ss, &wg)
-		case ss := <-t.sentMessage:
-			if t.streamSenders[ss.P] == ss {
-				t.sendBufFree[ss.P]++
-			}
 		case ss := <-t.senderComplete:
 			t.handleSenderComplete(ss)
 		case req := <-t.sendMessageReq:
@@ -552,12 +590,17 @@ func (t *Topic) loop() {
 			if !ok {
 				continue
 			}
-			t.sendBufFree[req.P]--
 			// todo: handle dropped messages better
 			ss.sendMessage(req.Message)
 
 		case ch := <-t.peersWithCapacityCh:
 			ch <- t.peerWithCapacity()
+		case req := <-t.peerCapacityCh:
+			var resp peerCapacityResponse
+			if ss, ok := t.streamSenders[req.P]; ok {
+				resp = peerCapacityResponse{Capacity: int(ss.free.Load()), Found: true}
+			}
+			req.Resp <- resp
 
 		case pd := <-t.peerDisconnectCh:
 			t.disconnectPeer(pd.P, pd.Conn)
@@ -582,9 +625,9 @@ func (t *Topic) disconnectPeer(p conn.PeerID, c conn.Conn) {
 }
 
 func (t *Topic) peerWithCapacity() []conn.PeerID {
-	peers := make([]conn.PeerID, 0, len(t.sendBufFree))
-	for p, v := range t.sendBufFree {
-		if v <= 0 {
+	peers := make([]conn.PeerID, 0, len(t.streamSenders))
+	for p, ss := range t.streamSenders {
+		if ss.free.Load() <= 0 {
 			continue
 		}
 		peers = append(peers, p)
@@ -596,19 +639,18 @@ func (t *Topic) handleSenderComplete(ss *streamSender) {
 	// only delete if we've not overwritten the map entry and dropped the reference
 	if t.streamSenders[ss.P] == ss {
 		delete(t.streamSenders, ss.P)
-		delete(t.sendBufFree, ss.P)
 	}
 }
 
-func (t *Topic) handleStreamSender(ss streamSender, wg *sync.WaitGroup) {
+func (t *Topic) handleStreamSender(ss *streamSender, wg *sync.WaitGroup) {
 	ssold, ok := t.streamSenders[ss.P]
 	if ok {
 		ssold.Cancel()
 		ssold.Stream.ResetWithError(conn.StreamErrorCodeUndecided)
 	}
 	ss.Ctx, ss.Cancel = context.WithCancel(t.ctx)
-	t.streamSenders[ss.P] = &ss
-	t.sendBufFree[ss.P] = sendMessageBufferSize
+	ss.free.Store(int32(t.sendQueueSize))
+	t.streamSenders[ss.P] = ss
 	wg.Go(ss.sendLoop)
 }
 
@@ -635,7 +677,6 @@ func (t *Topic) drainTillComplete(done chan struct{}) {
 		case <-t.peerDisconnectCh:
 		case <-t.senderComplete:
 		case <-t.sendMessageReq:
-		case <-t.sentMessage:
 		case <-done:
 			for {
 				select {
@@ -646,7 +687,6 @@ func (t *Topic) drainTillComplete(done chan struct{}) {
 				case <-t.peerDisconnectCh:
 				case <-t.senderComplete:
 				case <-t.sendMessageReq:
-				case <-t.sentMessage:
 				default:
 					return
 
@@ -670,19 +710,22 @@ func (r byteReader) ReadByte() (byte, error) {
 }
 
 type streamSender struct {
-	P             conn.PeerID
-	Stream        conn.Stream
-	SentMessageCh chan *streamSender
-	CompleteCh    chan *streamSender
-	Ctx           context.Context
-	Cancel        context.CancelFunc
-	msgs          chan *pb.ObjectPieces
+	P              conn.PeerID
+	Stream         conn.Stream
+	CompleteCh     chan *streamSender
+	OnSendComplete func(ctx context.Context, p conn.PeerID)
+	Ctx            context.Context
+	Cancel         context.CancelFunc
+	msgs           chan *pb.ObjectPieces
+	free           atomic.Int32
 }
 
 func (s *streamSender) sendMessage(m *pb.ObjectPieces) {
+	s.free.Add(-1)
 	select {
 	case s.msgs <- m:
 	default:
+		s.free.Add(1)
 		// TODO: use slog here
 		fmt.Println("msg sending failed: buffer full", s.P)
 	}
@@ -718,7 +761,10 @@ func (s *streamSender) sendLoop() {
 			return
 		}
 
-		s.SentMessageCh <- s
+		s.free.Add(1)
+		if s.OnSendComplete != nil {
+			s.OnSendComplete(s.Ctx, s.P)
+		}
 	}
 }
 

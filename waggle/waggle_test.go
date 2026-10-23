@@ -15,12 +15,12 @@ func TestWaggleMessageSending(t *testing.T) {
 		tn := newTestNet(t, 2)
 
 		n1, n2 := tn.Nodes[0], tn.Nodes[1]
-		tp1, err := n1.Waggle.NewTopic("topic1")
+		tp1, err := n1.Waggle.NewTopic("topic1", 0, nil)
 		require.NoError(t, err)
 		tp1.Subscribe()
 		defer tp1.Close()
 
-		tp2, err := n2.Waggle.NewTopic("topic1")
+		tp2, err := n2.Waggle.NewTopic("topic1", 0, nil)
 		require.NoError(t, err)
 		defer tp2.Close()
 
@@ -79,14 +79,14 @@ func TestWaggleMessageSendingMultiple(t *testing.T) {
 
 		topic := "topic1"
 		n := tn.Nodes[0]
-		tp, err := n.Waggle.NewTopic(topic)
+		tp, err := n.Waggle.NewTopic(topic, 0, nil)
 		require.NoError(t, err)
 		defer tp.Close()
 
 		subscribers := make([]*Topic, 0, numNodes-1)
 		expectedPeers := make([]conn.PeerID, 0, numNodes-1)
 		for _, nn := range tn.Nodes[1:] {
-			tt, err := nn.Waggle.NewTopic(topic)
+			tt, err := nn.Waggle.NewTopic(topic, 0, nil)
 			require.NoError(t, err)
 			tt.Subscribe()
 			defer tt.Close()

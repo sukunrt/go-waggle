@@ -62,7 +62,7 @@ type peerObject struct {
 
 func newBroadcaster(t *testing.T, n node) *broadcaster {
 	t.Helper()
-	topic, err := n.Waggle.NewTopic("broadcast")
+	topic, err := n.Waggle.NewTopic("broadcast", 0, nil)
 	require.NoError(t, err)
 	topic.Subscribe()
 	ctx, cancel := context.WithCancel(t.Context())

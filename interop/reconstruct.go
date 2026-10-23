@@ -131,7 +131,7 @@ func (wh *waggleHost) InitWaggle() error {
 }
 
 func (wh *waggleHost) SubscribeToTopic(topicID string) error {
-	t, err := wh.Waggle.NewTopic(topicID)
+	t, err := wh.Waggle.NewTopic(topicID, 0, nil)
 	if err != nil {
 		return err
 	}
