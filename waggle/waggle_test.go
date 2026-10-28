@@ -42,7 +42,7 @@ func TestWaggleMessageSending(t *testing.T) {
 
 		synctest.Wait()
 
-		peers := tp2.PeersWithCapacity()
+		peers := tp2.PeersWithCapacity(ControlStream)
 		require.Contains(t, peers, n1.P)
 
 		tp2.SendMessage(n1.P, &pb.ObjectPieces{
@@ -101,7 +101,7 @@ func TestWaggleMessageSendingMultiple(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, topic, topicID)
 
-			peers := tp.PeersWithCapacity()
+			peers := tp.PeersWithCapacity(ControlStream)
 			require.ElementsMatch(t, expectedPeers, peers)
 			for _, p := range peers {
 				tp.SendMessage(p, &pb.ObjectPieces{
@@ -117,5 +117,46 @@ func TestWaggleMessageSendingMultiple(t *testing.T) {
 			}
 		}
 
+	})
+}
+
+func TestWaggleDataStream(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		tn := newTestNet(t, 2)
+		n1, n2 := tn.Nodes[0], tn.Nodes[1]
+
+		tp1, err := n1.Waggle.NewTopic("topic1", 0, nil, WithDataStream())
+		require.NoError(t, err)
+		tp1.Subscribe()
+		defer tp1.Close()
+
+		tp2, err := n2.Waggle.NewTopic("topic1", 0, nil, WithControlQueueSize(1))
+		require.NoError(t, err)
+		defer tp2.Close()
+
+		_, c2 := connectNodes(t, n1, n2)
+		for range 2 {
+			s, err := c2.AcceptStream(t.Context())
+			require.NoError(t, err)
+			_, err = n2.Waggle.HandleInboundStream(n1.P, s)
+			require.NoError(t, err)
+		}
+		synctest.Wait()
+
+		n, err := tp2.GetPeerCapacity(n1.P, ControlStream)
+		require.NoError(t, err)
+		require.Equal(t, 1, n)
+		n, err = tp2.GetPeerCapacity(n1.P, DataStream)
+		require.NoError(t, err)
+		require.Equal(t, defaultSendQueueSize, n)
+
+		// The control message must not wait behind the pieces.
+		tp2.SendMessage(n1.P, &pb.ObjectPieces{ObjectID: []byte("data"), Pieces: make([]byte, 8<<20)})
+		tp2.SendMessage(n1.P, &pb.ObjectPieces{ObjectID: []byte("control"), PiecesMetadata: []byte("md")})
+
+		_, msg := tp1.ReceiveMessage()
+		require.Equal(t, []byte("control"), msg.ObjectID)
+		_, msg = tp1.ReceiveMessage()
+		require.Equal(t, []byte("data"), msg.ObjectID)
 	})
 }

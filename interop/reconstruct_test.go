@@ -57,7 +57,7 @@ func TestTwoNodes(t *testing.T) {
 	require.NoError(t, a.Host.Connect(context.Background(), peer.AddrInfo{ID: b.Host.ID(), Addrs: b.Host.Addrs()}))
 
 	hasPeer := func(wh *waggleHost) func() bool {
-		return func() bool { return len(wh.topics[topic].PeersWithCapacity()) == 1 }
+		return func() bool { return len(wh.topics[topic].PeersWithCapacity(waggle.ControlStream)) == 1 }
 	}
 	require.Eventually(t, hasPeer(a), 5*time.Second, 10*time.Millisecond)
 	require.Eventually(t, hasPeer(b), 5*time.Second, 10*time.Millisecond)
@@ -100,7 +100,7 @@ func TestTenNodes(t *testing.T) {
 	}
 	for i := range n {
 		require.Eventually(t, func() bool {
-			return len(nodes[i].topics[topic].PeersWithCapacity()) == len(neighbors[i])
+			return len(nodes[i].topics[topic].PeersWithCapacity(waggle.ControlStream)) == len(neighbors[i])
 		}, 10*time.Second, 10*time.Millisecond, "node %d", i)
 	}
 

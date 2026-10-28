@@ -113,4 +113,6 @@ Add an error code for resetting this stream for the topic name.
 
 ## How can we restart streams? ?
 
+## How to limit damage a single peer can do by sending too many garbage attestations?  
 
+## 

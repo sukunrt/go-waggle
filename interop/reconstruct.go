@@ -256,7 +256,7 @@ func (wh *waggleHost) flood(topicID string, objectID uint64, o *Object) {
 	if !ok {
 		return
 	}
-	for _, p := range t.PeersWithCapacity() {
+	for _, p := range t.PeersWithCapacity(waggle.DataStream) {
 		wh.send(topicID, objectID, o, p)
 	}
 }

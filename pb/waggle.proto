@@ -4,6 +4,8 @@ option go_package="github.com/sukunrt/go-waggle/pb";
 
 message TopicSubscription {
   optional bytes topicID = 1;
+  // 0 or absent is the control stream. 1 is the data stream.
+  optional uint32 stream = 2;
 }
 
 message ObjectPieces {

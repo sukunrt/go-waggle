@@ -19,6 +19,43 @@ const (
 	maxMessageLength = 10 * 1 << 20
 )
 
+// StreamKind is the kind of a topic stream.
+type StreamKind int
+
+const (
+	// ControlStream carries messages without pieces. Without a data stream, it carries all messages.
+	ControlStream StreamKind = iota
+	// DataStream carries messages with pieces.
+	DataStream
+	numStreamKinds
+)
+
+func messageKind(m *pb.ObjectPieces) StreamKind {
+	if len(m.Pieces) > 0 {
+		return DataStream
+	}
+	return ControlStream
+}
+
+type streamKey struct {
+	P    conn.PeerID
+	Kind StreamKind
+}
+
+// TopicOption configures a topic.
+type TopicOption func(*Topic)
+
+// WithDataStream makes the topic open a separate data stream to each peer.
+func WithDataStream() TopicOption {
+	return func(t *Topic) { t.dataStream = true }
+}
+
+// WithControlQueueSize sets the free send slots per peer for the control stream.
+// Use it with peers that open a data stream. Without one, pieces also use these slots.
+func WithControlQueueSize(n int) TopicOption {
+	return func(t *Topic) { t.controlQueueSize = n }
+}
+
 type topicState struct {
 	Topic *Topic
 	Wg    sync.WaitGroup
@@ -33,7 +70,7 @@ type Waggle struct {
 	mx               sync.RWMutex
 	topics           map[string]*topicState
 	subscribedTopics map[string]*Topic
-	pendingStreams   map[string]map[conn.PeerID]conn.Stream
+	pendingStreams   map[string]map[streamKey]conn.Stream
 	peers            map[conn.PeerID]conn.Conn
 }
 
@@ -45,7 +82,7 @@ func NewWaggle() *Waggle {
 		cancel:           cancel,
 		topics:           make(map[string]*topicState),
 		subscribedTopics: make(map[string]*Topic),
-		pendingStreams:   make(map[string]map[conn.PeerID]conn.Stream),
+		pendingStreams:   make(map[string]map[streamKey]conn.Stream),
 		peers:            make(map[conn.PeerID]conn.Conn),
 	}
 }
@@ -100,6 +137,12 @@ func (w *Waggle) HandleInboundStream(p conn.PeerID, s conn.Stream) (topicID stri
 		return "", err
 	}
 
+	kind := StreamKind(topicSub.GetStream())
+	if kind >= numStreamKinds {
+		s.ResetWithError(conn.StreamErrorCodeUndecided)
+		return "", errors.New("unknown stream kind")
+	}
+
 	topicID = string(topicSub.TopicID)
 	w.mx.Lock()
 	defer w.mx.Unlock()
@@ -109,25 +152,26 @@ func (w *Waggle) HandleInboundStream(p conn.PeerID, s conn.Stream) (topicID stri
 		// TODO: Limit the sizes of these maps
 		tm, ok := w.pendingStreams[topicID]
 		if !ok {
-			tm = make(map[conn.PeerID]conn.Stream)
+			tm = make(map[streamKey]conn.Stream)
 			w.pendingStreams[topicID] = tm
 		}
-		ss := tm[p]
+		k := streamKey{P: p, Kind: kind}
+		ss := tm[k]
 		if ss != nil {
 			// multiple streams. reset the earlier stream
 			// note it's not necessary that this is the correct stream to reset
 			// streams may be delivered to us out of order.
 			ss.ResetWithError(conn.StreamErrorCodeUndecided)
 		}
-		tm[p] = s
+		tm[k] = s
 	} else {
-		t.Topic.handleSendStream(p, s)
+		t.Topic.handleSendStream(p, kind, s)
 	}
 
 	return topicID, nil
 }
 
-func (w *Waggle) openReceiveStream(c conn.Conn, topicID string) (_ conn.Stream, errorVal error) {
+func (w *Waggle) openReceiveStream(c conn.Conn, topicID string, kind StreamKind) (_ conn.Stream, errorVal error) {
 	s, err := c.NewStream()
 	if err != nil {
 		return nil, err
@@ -140,6 +184,9 @@ func (w *Waggle) openReceiveStream(c conn.Conn, topicID string) (_ conn.Stream, 
 
 	topicSub := pb.TopicSubscription{
 		TopicID: []byte(topicID),
+	}
+	if kind != ControlStream {
+		topicSub.Stream = proto.Uint32(uint32(kind))
 	}
 	now := time.Now()
 	if err := s.SetWriteDeadline(now.Add(5 * time.Second)); err != nil {
@@ -172,18 +219,20 @@ func (w *Waggle) AddPeer(p conn.PeerID, c conn.Conn) {
 	w.peers[p] = c
 	var wg sync.WaitGroup
 	for topicID, t := range w.subscribedTopics {
-		wg.Add(1)
-		t.wg.Add(1)
-		go func() {
-			defer wg.Done()
-			defer t.wg.Done()
-			s, err := w.openReceiveStream(c, topicID)
-			if err != nil {
-				// TODO: handle this
-				return
-			}
-			t.handleReceiveStream(p, s)
-		}()
+		for _, kind := range t.streamKinds() {
+			wg.Add(1)
+			t.wg.Add(1)
+			go func() {
+				defer wg.Done()
+				defer t.wg.Done()
+				s, err := w.openReceiveStream(c, topicID, kind)
+				if err != nil {
+					// TODO: handle this
+					return
+				}
+				t.handleReceiveStream(p, kind, s)
+			}()
+		}
 	}
 	w.mx.Unlock()
 
@@ -203,10 +252,11 @@ func (w *Waggle) DisconnectPeer(p conn.PeerID, c conn.Conn) {
 	}
 
 	for topicID, m := range w.pendingStreams {
-		s, ok := m[p]
-		if ok && s.Conn() == c {
-			s.ResetWithError(conn.StreamErrorCodeUndecided)
-			delete(m, p)
+		for k, s := range m {
+			if k.P == p && s.Conn() == c {
+				s.ResetWithError(conn.StreamErrorCodeUndecided)
+				delete(m, k)
+			}
 		}
 		if len(m) == 0 {
 			delete(w.pendingStreams, topicID)
@@ -220,7 +270,7 @@ func (w *Waggle) DisconnectPeer(p conn.PeerID, c conn.Conn) {
 
 // NewTopic creates a waggle topic. sendQueueSize is the free send slots per peer, 0 sets the default.
 // onSendComplete is called on the peer's sender goroutine after each sent message. It can be nil.
-func (w *Waggle) NewTopic(topicID string, sendQueueSize int, onSendComplete func(ctx context.Context, p conn.PeerID)) (*Topic, error) {
+func (w *Waggle) NewTopic(topicID string, sendQueueSize int, onSendComplete func(ctx context.Context, p conn.PeerID), opts ...TopicOption) (*Topic, error) {
 	if len(topicID) >= 1024 {
 		return nil, errors.New("topic id too long")
 	}
@@ -237,11 +287,14 @@ func (w *Waggle) NewTopic(topicID string, sendQueueSize int, onSendComplete func
 		return nil, errors.New("topic already exists")
 	}
 	t := newTopic(w.ctx, w, topicID, sendQueueSize, onSendComplete)
+	for _, o := range opts {
+		o(t)
+	}
 	w.topics[topicID] = &topicState{Topic: t}
 	t.Start()
 
-	for p, s := range w.pendingStreams[topicID] {
-		t.handleSendStream(p, s)
+	for k, s := range w.pendingStreams[topicID] {
+		t.handleSendStream(k.P, k.Kind, s)
 	}
 	delete(w.pendingStreams, topicID)
 
@@ -261,14 +314,16 @@ func (w *Waggle) subscribe(t *Topic) error {
 	}
 	w.subscribedTopics[t.TopicID] = t
 	for p, c := range w.peers {
-		ts.Wg.Go(func() {
-			s, err := w.openReceiveStream(c, t.TopicID)
-			if err != nil {
-				// TODO: handle this
-				return
-			}
-			t.handleReceiveStream(p, s)
-		})
+		for _, kind := range t.streamKinds() {
+			ts.Wg.Go(func() {
+				s, err := w.openReceiveStream(c, t.TopicID, kind)
+				if err != nil {
+					// TODO: handle this
+					return
+				}
+				t.handleReceiveStream(p, kind, s)
+			})
+		}
 	}
 	return nil
 }
@@ -302,6 +357,7 @@ type incomingMessage struct {
 
 type receiveStream struct {
 	P      conn.PeerID
+	Kind   StreamKind
 	Stream conn.Stream
 }
 
@@ -325,7 +381,13 @@ type peerDisconnected struct {
 
 type peerCapacityRequest struct {
 	P    conn.PeerID
+	Kind StreamKind
 	Resp chan peerCapacityResponse
+}
+
+type peersWithCapacityRequest struct {
+	Kind StreamKind
+	Resp chan []conn.PeerID
 }
 
 type peerCapacityResponse struct {
@@ -350,6 +412,7 @@ type Topic struct {
 	ctx        context.Context
 	cancel     context.CancelFunc
 	subscribed atomic.Bool
+	dataStream bool
 
 	unsubscribeCh chan unsubscribeRequest
 	subscribeCh   chan subscribeRequest
@@ -358,17 +421,18 @@ type Topic struct {
 
 	incomingMessages chan incomingMessage
 	receiveStreamsCh chan receiveStream
-	receiveStreams   map[conn.PeerID]conn.Stream
+	receiveStreams   map[streamKey]conn.Stream
 	senderComplete   chan *streamSender
 	onSendComplete   func(ctx context.Context, p conn.PeerID)
 	sendQueueSize    int
+	controlQueueSize int
 
-	peersWithCapacityCh chan chan []conn.PeerID
+	peersWithCapacityCh chan peersWithCapacityRequest
 	peerCapacityCh      chan peerCapacityRequest
 	sendMessageReq      chan sendMessageRequest
 
 	streamSenderCh chan *streamSender
-	streamSenders  map[conn.PeerID]*streamSender
+	streamSenders  map[streamKey]*streamSender
 }
 
 func newTopic(ctx context.Context, w *Waggle, topicID string, sendQueueSize int, onSendComplete func(ctx context.Context, p conn.PeerID)) *Topic {
@@ -383,17 +447,31 @@ func newTopic(ctx context.Context, w *Waggle, topicID string, sendQueueSize int,
 		peerDisconnectCh:    make(chan peerDisconnected, 1),
 		incomingMessages:    make(chan incomingMessage, 32),
 		receiveStreamsCh:    make(chan receiveStream, 16),
-		receiveStreams:      map[conn.PeerID]conn.Stream{},
+		receiveStreams:      map[streamKey]conn.Stream{},
 		senderComplete:      make(chan *streamSender, 8),
 		onSendComplete:      onSendComplete,
 		sendQueueSize:       sendQueueSize,
-		peersWithCapacityCh: make(chan chan []conn.PeerID, 4),
+		peersWithCapacityCh: make(chan peersWithCapacityRequest, 4),
 		peerCapacityCh:      make(chan peerCapacityRequest, 4),
 		sendMessageReq:      make(chan sendMessageRequest, 4),
 		streamSenderCh:      make(chan *streamSender, 8),
-		streamSenders:       map[conn.PeerID]*streamSender{},
+		streamSenders:       map[streamKey]*streamSender{},
 	}
 
+}
+
+func (t *Topic) queueSize(kind StreamKind) int {
+	if kind == ControlStream && t.controlQueueSize > 0 {
+		return t.controlQueueSize
+	}
+	return t.sendQueueSize
+}
+
+func (t *Topic) streamKinds() []StreamKind {
+	if t.dataStream {
+		return []StreamKind{ControlStream, DataStream}
+	}
+	return []StreamKind{ControlStream}
 }
 
 func (t *Topic) Start() {
@@ -439,7 +517,7 @@ func (t *Topic) Unsubscribe() {
 
 const defaultSendQueueSize = 4
 
-func (t *Topic) handleSendStream(p conn.PeerID, s conn.Stream) {
+func (t *Topic) handleSendStream(p conn.PeerID, kind StreamKind, s conn.Stream) {
 	if t.ctx.Err() != nil {
 		s.ResetWithError(conn.StreamErrorCodeUndecided)
 		return
@@ -448,17 +526,18 @@ func (t *Topic) handleSendStream(p conn.PeerID, s conn.Stream) {
 	select {
 	case t.streamSenderCh <- &streamSender{
 		P:              p,
+		Kind:           kind,
 		Stream:         s,
 		CompleteCh:     t.senderComplete,
 		OnSendComplete: t.onSendComplete,
-		msgs:           make(chan *pb.ObjectPieces, t.sendQueueSize+4),
+		msgs:           make(chan *pb.ObjectPieces, t.queueSize(kind)+4),
 	}:
 	case <-t.ctx.Done():
 		s.ResetWithError(conn.StreamErrorCodeUndecided)
 	}
 }
 
-func (t *Topic) handleReceiveStream(p conn.PeerID, s conn.Stream) {
+func (t *Topic) handleReceiveStream(p conn.PeerID, kind StreamKind, s conn.Stream) {
 	if t.ctx.Err() != nil {
 		s.ResetWithError(conn.StreamErrorCodeUndecided)
 		return
@@ -467,6 +546,7 @@ func (t *Topic) handleReceiveStream(p conn.PeerID, s conn.Stream) {
 	select {
 	case t.receiveStreamsCh <- receiveStream{
 		P:      p,
+		Kind:   kind,
 		Stream: s,
 	}:
 	case <-t.ctx.Done():
@@ -491,26 +571,26 @@ func (t *Topic) DisconnectPeer(p conn.PeerID, c conn.Conn) {
 	}
 }
 
-// PeersWithCapacity returns all free peers to send a message to.
+// PeersWithCapacity returns the peers with free send slots for messages of kind.
 // It must not be used concurrently with `SendMessage`
-func (t *Topic) PeersWithCapacity() []conn.PeerID {
-	ch := make(chan []conn.PeerID, 1)
+func (t *Topic) PeersWithCapacity(kind StreamKind) []conn.PeerID {
+	req := peersWithCapacityRequest{Kind: kind, Resp: make(chan []conn.PeerID, 1)}
 	select {
-	case t.peersWithCapacityCh <- ch:
+	case t.peersWithCapacityCh <- req:
 	case <-t.ctx.Done():
 		return nil
 	}
 	select {
-	case peers := <-ch:
+	case peers := <-req.Resp:
 		return peers
 	case <-t.ctx.Done():
 		return nil
 	}
 }
 
-// GetPeerCapacity returns the number of free send slots for peer p.
-func (t *Topic) GetPeerCapacity(p conn.PeerID) (int, error) {
-	req := peerCapacityRequest{P: p, Resp: make(chan peerCapacityResponse, 1)}
+// GetPeerCapacity returns the number of free send slots for messages of kind to peer p.
+func (t *Topic) GetPeerCapacity(p conn.PeerID, kind StreamKind) (int, error) {
+	req := peerCapacityRequest{P: p, Kind: kind, Resp: make(chan peerCapacityResponse, 1)}
 	select {
 	case t.peerCapacityCh <- req:
 	case <-t.ctx.Done():
@@ -527,7 +607,7 @@ func (t *Topic) GetPeerCapacity(p conn.PeerID) (int, error) {
 	}
 }
 
-// SendMessage sends the msg to peer p
+// SendMessage sends the msg to peer p. A msg with pieces goes on the data stream, if there is one.
 func (t *Topic) SendMessage(p conn.PeerID, msg *pb.ObjectPieces) {
 	if t.ctx.Err() != nil {
 		return
@@ -593,18 +673,18 @@ func (t *Topic) loop() {
 		case ss := <-t.senderComplete:
 			t.handleSenderComplete(ss)
 		case req := <-t.sendMessageReq:
-			ss, ok := t.streamSenders[req.P]
-			if !ok {
+			ss := t.sender(req.P, messageKind(req.Message))
+			if ss == nil {
 				continue
 			}
 			// todo: handle dropped messages better
 			ss.sendMessage(req.Message)
 
-		case ch := <-t.peersWithCapacityCh:
-			ch <- t.peerWithCapacity()
+		case req := <-t.peersWithCapacityCh:
+			req.Resp <- t.peerWithCapacity(req.Kind)
 		case req := <-t.peerCapacityCh:
 			var resp peerCapacityResponse
-			if ss, ok := t.streamSenders[req.P]; ok {
+			if ss := t.sender(req.P, req.Kind); ss != nil {
 				resp = peerCapacityResponse{Capacity: int(ss.free.Load()), Found: true}
 			}
 			req.Resp <- resp
@@ -616,48 +696,58 @@ func (t *Topic) loop() {
 }
 
 func (t *Topic) disconnectPeer(p conn.PeerID, c conn.Conn) {
-	ss, ok := t.streamSenders[p]
-	if ok {
-		if ss.Stream.Conn() == c {
+	for kind := range numStreamKinds {
+		k := streamKey{P: p, Kind: kind}
+		if ss, ok := t.streamSenders[k]; ok && ss.Stream.Conn() == c {
 			ss.Cancel()
 			ss.Stream.ResetWithError(conn.StreamErrorCodeUndecided)
 		}
-	}
-	rs, ok := t.receiveStreams[p]
-	if ok {
-		if rs.Conn() == c {
+		if rs, ok := t.receiveStreams[k]; ok && rs.Conn() == c {
 			rs.ResetWithError(conn.StreamErrorCodeUndecided)
 		}
 	}
 }
 
-func (t *Topic) peerWithCapacity() []conn.PeerID {
+// sender returns the sender for messages of kind to p. Without a data stream, it returns the control stream sender.
+func (t *Topic) sender(p conn.PeerID, kind StreamKind) *streamSender {
+	if ss, ok := t.streamSenders[streamKey{P: p, Kind: kind}]; ok {
+		return ss
+	}
+	return t.streamSenders[streamKey{P: p, Kind: ControlStream}]
+}
+
+func (t *Topic) peerWithCapacity(kind StreamKind) []conn.PeerID {
 	peers := make([]conn.PeerID, 0, len(t.streamSenders))
-	for p, ss := range t.streamSenders {
-		if ss.free.Load() <= 0 {
+	for k := range t.streamSenders {
+		if k.Kind != ControlStream {
 			continue
 		}
-		peers = append(peers, p)
+		if t.sender(k.P, kind).free.Load() <= 0 {
+			continue
+		}
+		peers = append(peers, k.P)
 	}
 	return peers
 }
 
 func (t *Topic) handleSenderComplete(ss *streamSender) {
 	// only delete if we've not overwritten the map entry and dropped the reference
-	if t.streamSenders[ss.P] == ss {
-		delete(t.streamSenders, ss.P)
+	k := streamKey{P: ss.P, Kind: ss.Kind}
+	if t.streamSenders[k] == ss {
+		delete(t.streamSenders, k)
 	}
 }
 
 func (t *Topic) handleStreamSender(ss *streamSender, wg *sync.WaitGroup) {
-	ssold, ok := t.streamSenders[ss.P]
+	k := streamKey{P: ss.P, Kind: ss.Kind}
+	ssold, ok := t.streamSenders[k]
 	if ok {
 		ssold.Cancel()
 		ssold.Stream.ResetWithError(conn.StreamErrorCodeUndecided)
 	}
 	ss.Ctx, ss.Cancel = context.WithCancel(t.ctx)
-	ss.free.Store(int32(t.sendQueueSize))
-	t.streamSenders[ss.P] = ss
+	ss.free.Store(int32(t.queueSize(ss.Kind)))
+	t.streamSenders[k] = ss
 	wg.Go(ss.sendLoop)
 }
 
@@ -665,11 +755,12 @@ func (t *Topic) handleReceiveStreamLoop(rs receiveStream, wg *sync.WaitGroup) {
 	if !t.subscribed.Load() {
 		rs.Stream.ResetWithError(conn.StreamErrorCodeUndecided)
 	} else {
-		ss, ok := t.receiveStreams[rs.P]
+		k := streamKey{P: rs.P, Kind: rs.Kind}
+		ss, ok := t.receiveStreams[k]
 		if ok {
 			ss.ResetWithError(conn.StreamErrorCodeUndecided)
 		}
-		t.receiveStreams[rs.P] = rs.Stream
+		t.receiveStreams[k] = rs.Stream
 		wg.Go(func() { t.recvLoop(rs.P, rs.Stream) })
 	}
 }
@@ -718,6 +809,7 @@ func (r byteReader) ReadByte() (byte, error) {
 
 type streamSender struct {
 	P              conn.PeerID
+	Kind           StreamKind
 	Stream         conn.Stream
 	CompleteCh     chan *streamSender
 	OnSendComplete func(ctx context.Context, p conn.PeerID)

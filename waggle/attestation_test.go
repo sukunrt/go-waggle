@@ -68,6 +68,10 @@ var (
 	attSeed = uint64(attEnvInt("ATT_SEED", 1))
 	// attDropHave is a test-only fault: drop this percent of delta lists. The told cursor still moves.
 	attDropHave = attEnvInt("ATT_DROP_HAVE", 0)
+	// attSplit sends pieces on a data stream and all other messages on a control stream.
+	attSplit = attEnvBool("ATT_SPLIT", false)
+	// attCtrlQueue is the send slots per peer for the control stream. 0 is the same as the data stream.
+	attCtrlQueue = attEnvInt("ATT_CTRL_QUEUE", 0)
 )
 
 func attSize(full, small int) int {
@@ -195,10 +199,10 @@ func attConfFor(s attStrategy) attConf {
 }
 
 func attConfig(c attConf) string {
-	return fmt.Sprintf("seed=%d mesh=%d degree=%d fanout=%d sendTick=%s metaTick=%s metaPeers=%d diffPush=%d maxSends=%d eagerBatch=%d reqTimeout=%s hedge=%s pushRare=%d announceEdges=%d tailReq=%d tailPeers=%d metaGap=%s piggyback=%t pushNow=%t pickOrder=%t metaRotate=%t syncPeriod=%s syncPeers=%d syncOpen=%t syncCap=%d syncAge=%s syncFlag=%t dropHave=%d queue=%d",
+	return fmt.Sprintf("seed=%d mesh=%d degree=%d fanout=%d sendTick=%s metaTick=%s metaPeers=%d diffPush=%d maxSends=%d eagerBatch=%d reqTimeout=%s hedge=%s pushRare=%d announceEdges=%d tailReq=%d tailPeers=%d metaGap=%s piggyback=%t pushNow=%t pickOrder=%t metaRotate=%t syncPeriod=%s syncPeers=%d syncOpen=%t syncCap=%d syncAge=%s syncFlag=%t dropHave=%d queue=%d split=%t ctrlQueue=%d",
 		attSeed, attMeshNodes, attMeshDegree, attFanoutNodes, attSendTick, c.MetaTick, c.MetaPeers,
 		c.DiffPush, c.MaxSends, attEagerBatch, attRequestTimeout, c.Hedge, c.PushRare, c.AnnounceEdges, c.TailReq, c.TailPeers,
-		c.MetaGap, c.Piggyback, c.PushNow, c.PickOrder, c.MetaRotate, c.SyncPeriod, c.SyncPeers, c.SyncOpen, c.SyncCap, c.SyncAge, c.SyncFlag, attDropHave, attSendQueue)
+		c.MetaGap, c.Piggyback, c.PushNow, c.PickOrder, c.MetaRotate, c.SyncPeriod, c.SyncPeers, c.SyncOpen, c.SyncCap, c.SyncAge, c.SyncFlag, attDropHave, attSendQueue, attSplit, attCtrlQueue)
 }
 
 type attRegion int
@@ -309,6 +313,13 @@ func runAttestationSim(t *testing.T, strategy attStrategy) {
 			connWg.Wait()
 		})
 
+		var opts []TopicOption
+		if attSplit {
+			opts = append(opts, WithDataStream())
+		}
+		if attCtrlQueue > 0 {
+			opts = append(opts, WithControlQueueSize(attCtrlQueue))
+		}
 		for i, n := range an.Nodes {
 			var onSendComplete func(context.Context, conn.PeerID)
 			if i < attMeshNodes {
@@ -317,7 +328,7 @@ func runAttestationSim(t *testing.T, strategy attStrategy) {
 					onSendComplete = attesters[i].onSendComplete
 				}
 			}
-			tp, err := n.Waggle.NewTopic(attTopic, attSendQueue, onSendComplete)
+			tp, err := n.Waggle.NewTopic(attTopic, attSendQueue, onSendComplete, opts...)
 			require.NoError(t, err)
 			topics[i] = tp
 			if i < attMeshNodes {
@@ -333,11 +344,11 @@ func runAttestationSim(t *testing.T, strategy attStrategy) {
 		synctest.Wait()
 		for i, a := range attesters {
 			a.self = an.Nodes[i].P
-			a.setPeers(a.topic.PeersWithCapacity())
+			a.setPeers(a.topic.PeersWithCapacity(ControlStream))
 			require.Len(t, a.peers, attMeshDegree, "mesh node %d", i)
 		}
 		for f, peers := range fanoutPeers {
-			require.Len(t, topics[attMeshNodes+f].PeersWithCapacity(), len(peers), "fanout node %d", f)
+			require.Len(t, topics[attMeshNodes+f].PeersWithCapacity(DataStream), len(peers), "fanout node %d", f)
 		}
 
 		start := time.Now()
@@ -352,7 +363,7 @@ func runAttestationSim(t *testing.T, strategy attStrategy) {
 		for f := range attFanoutNodes {
 			tp := topics[attMeshNodes+f]
 			msg := &pb.ObjectPieces{ObjectID: attObjectID[:], Pieces: attEncodePieces([]uint32{uint32(f)})}
-			for _, p := range tp.PeersWithCapacity() {
+			for _, p := range tp.PeersWithCapacity(DataStream) {
 				tp.SendMessage(p, msg)
 			}
 		}
@@ -558,7 +569,7 @@ type attester struct {
 	doneAt    time.Time
 	got       []uint32 // Ids in the order we got them.
 	gotAt     []time.Time
-	told      []int    // Per peer, the part of got that the last delta list covered.
+	told      []int // Per peer, the part of got that the last delta list covered.
 	lastMeta  []time.Time
 	due       []bool // Per peer, a delta list is due. Only with MetaRotate.
 	syncMe    []bool // Per peer, the next delta list has the sync flag.
@@ -979,7 +990,7 @@ func (a *attester) sendSync() {
 		}
 	}
 	msg := &pb.ObjectPieces{ObjectID: attObjectID[:], PiecesMetadata: attEncodeIDs(attMetaSync, ids)}
-	for i, pi := range a.freePeers() {
+	for i, pi := range a.freePeers(ControlStream) {
 		if i == a.cfg.SyncPeers {
 			break
 		}
@@ -1019,8 +1030,13 @@ func (a *attester) tick() {
 	}
 	a.retryRequests()
 	free := make([]bool, len(a.peers))
-	for _, pi := range a.freePeers() {
+	for _, pi := range a.freePeers(ControlStream) {
 		free[pi] = true
+	}
+	if attSplit {
+		for _, pi := range a.freePeers(DataStream) {
+			free[pi] = true
+		}
 	}
 	for pi := range a.peers {
 		if !a.hasQueued(pi) {
@@ -1064,7 +1080,7 @@ func (a *attester) assignPending() {
 
 func (a *attester) pushLeastSent(maxPeers, minBatch int) {
 	sent := 0
-	for _, pi := range a.freePeers() {
+	for _, pi := range a.freePeers(DataStream) {
 		if sent == maxPeers {
 			return
 		}
@@ -1119,7 +1135,7 @@ func (a *attester) sendMetadata() {
 	var full []byte
 	now := time.Now()
 	sent := 0
-	for _, pi := range a.freePeers() {
+	for _, pi := range a.freePeers(ControlStream) {
 		if sent == a.cfg.MetaPeers {
 			return
 		}
@@ -1190,9 +1206,9 @@ func (a *attester) haveList(pi int) []byte {
 	return attEncodeIDs(attMetaHave, ids)
 }
 
-// freePeers returns the peers with capacity in random order.
-func (a *attester) freePeers() []int {
-	peers := a.topic.PeersWithCapacity()
+// freePeers returns the peers with capacity for messages of kind in random order.
+func (a *attester) freePeers(kind StreamKind) []int {
+	peers := a.topic.PeersWithCapacity(kind)
 	idx := make([]int, 0, len(peers))
 	for _, p := range peers {
 		if pi, ok := a.peerIdx[p]; ok {
@@ -1208,26 +1224,43 @@ func (a *attester) hasQueued(pi int) bool {
 }
 
 // flush sends queued requests, replies, pushes and sync replies to pi while it has capacity.
+// With attSplit, requests use the control stream slots and pieces use the data stream slots.
 func (a *attester) flush(pi int) {
-	n, err := a.topic.GetPeerCapacity(a.peers[pi])
+	p := a.peers[pi]
+	n, err := a.topic.GetPeerCapacity(p, ControlStream)
 	if err != nil {
 		return
 	}
-	for ; n > 0 && a.sendNext(pi); n-- {
+	if attSplit {
+		for ; n > 0 && a.sendRequest(pi); n-- {
+		}
+		if n, err = a.topic.GetPeerCapacity(p, DataStream); err != nil {
+			return
+		}
+		for ; n > 0 && a.sendData(pi); n-- {
+		}
+	} else {
+		for ; n > 0 && (a.sendRequest(pi) || a.sendData(pi)); n-- {
+		}
 	}
 	if a.hasQueued(pi) {
 		a.stats.Held++
 	}
 }
 
-func (a *attester) sendNext(pi int) bool {
-	if ids := attTake(&a.requestQ[pi], attMaxRequest, func(id uint32) bool { return !a.have[id] }); len(ids) > 0 {
-		a.nr.dequeue(attKindRequest, pi, ids)
-		a.send(pi, attKindRequest, &pb.ObjectPieces{ObjectID: attObjectID[:], PiecesMetadata: attEncodeIDs(attMetaRequest, ids)})
-		a.stats.Requests++
-		a.stats.IdsRequested += len(ids)
-		return true
+func (a *attester) sendRequest(pi int) bool {
+	ids := attTake(&a.requestQ[pi], attMaxRequest, func(id uint32) bool { return !a.have[id] })
+	if len(ids) == 0 {
+		return false
 	}
+	a.nr.dequeue(attKindRequest, pi, ids)
+	a.send(pi, attKindRequest, &pb.ObjectPieces{ObjectID: attObjectID[:], PiecesMetadata: attEncodeIDs(attMetaRequest, ids)})
+	a.stats.Requests++
+	a.stats.IdsRequested += len(ids)
+	return true
+}
+
+func (a *attester) sendData(pi int) bool {
 	// claim marks ids as known so that a batch has no duplicates.
 	claim := func(id uint32) bool {
 		if a.known[pi][id] {
