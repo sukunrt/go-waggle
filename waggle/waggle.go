@@ -255,7 +255,10 @@ func (w *Waggle) subscribe(t *Topic) error {
 	if _, ok := w.subscribedTopics[t.TopicID]; ok {
 		return errors.New("topic already subscribed")
 	}
-	ts := w.topics[t.TopicID]
+	ts, ok := w.topics[t.TopicID]
+	if !ok {
+		return errors.New("topic closed")
+	}
 	w.subscribedTopics[t.TopicID] = t
 	for p, c := range w.peers {
 		ts.Wg.Go(func() {
@@ -279,11 +282,15 @@ func (w *Waggle) unsubscribe(t *Topic) error {
 
 func (w *Waggle) unregister(t *Topic) error {
 	w.mx.Lock()
-	defer w.mx.Unlock()
 	delete(w.subscribedTopics, t.TopicID)
+	var ts *topicState
 	if tt, ok := w.topics[t.TopicID]; ok {
 		delete(w.topics, t.TopicID)
-		tt.Wg.Wait()
+		ts = tt
+	}
+	w.mx.Unlock()
+	if ts != nil {
+		ts.Wg.Wait()
 	}
 	return nil
 }
